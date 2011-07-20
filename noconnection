@@ -1,0 +1,1078 @@
+#!/usr/bin/php
+<?php
+/**
+ * NOTICE OF LICENSE
+ *
+ * This source file is subject to the Academic Free License (AFL 3.0)
+ * that is available through the world-wide-web at this URL:
+ * http://opensource.org/licenses/afl-3.0.php
+ *
+ * @package     noconnection
+ * @copyright   Copyright (c) 2011 Artem Komarov (i.linker@gmail.com)
+ * @license     http://opensource.org/licenses/afl-3.0.php  Academic Free License (AFL 3.0)
+ */
+
+// enable for development
+//error_reporting(E_ALL | E_STRICT);
+if (version_compare(PHP_VERSION, '5.3', '<')) {
+    die("PHP version 5.3+ required\n");
+}
+
+if (count($argv) < 2) {
+    printUsage();exit;
+}
+
+$params = new CliParams($argv);
+
+try {
+    $config = $params->getConfig();
+    $action = new Action($config);
+    $action->run();
+
+} catch (ConfigException $e) {
+    // Lack of required options, invalid option specified, etc. - print the
+    // help screen and exit
+
+    printUsage();
+    die('ERROR: '.$e->getMessage()."\n");
+
+} catch (PackageXmlException $e) {
+    die('ERROR: package.xml: '.$e->getMessage()."\n");
+
+} catch (NoConnectionException $e) {
+    die('ERROR: '.$e->getMessage()."\n");
+}
+
+/**
+ * Handles package.xml - the file containing information about the package.
+ * Located inside .tgz package file.
+ */
+class PackageXml
+{
+    /**
+     * 'file' nodes in package.xml have 'role' attribute. Basing on these roles
+     * we decide which path to prepend.
+     * @var array
+     */
+    protected $_targets = array(
+        'magelocal' => 'app/code/local/',
+        'magecommunity' => 'app/code/community/',
+        'magecore' => 'app/code/core/',
+        'magedesign' => 'app/design/',
+        'mageetc' => 'app/etc/',
+        'magelib' => 'lib/',
+        'magelocale' => 'app/locale/',
+        'magemedia' => 'media/',
+        'mageskin' => 'skin/',
+        'mageweb' => '',
+        'magetest' => 'tests/',
+        'mage' => '',
+    );
+
+    /* @var SimpleXMLElement $_xml */
+    protected $_xml = null;
+    protected $_files = array();
+    protected $_config = null;
+    protected $_magentoPath = '';
+
+    public function __construct(Config $config)
+    {
+        $this->_config = $config;
+        $this->_magentoPath = $this->_config->getOption(Config::MAGE_PATH);
+    }
+
+    /**
+     * Loads XML file and registers its namespaces for future usage with XPath.
+     *
+     * @throws PackageXmlException
+     * @param string $fileName Path to the XML file
+     * @return void
+     */
+    public function loadFile($fileName)
+    {
+        if (!file_exists($fileName)) {
+            throw new PackageXmlException("File not found: {$fileName}");
+        }
+
+        $this->_xml = simplexml_load_file($fileName);
+
+        foreach ($this->_xml->getDocNamespaces() as $prefix => $ns) {
+            $prefix = empty($prefix) ? '_' : $prefix;
+            $this->_xml->registerXPathNamespace($prefix, $ns);
+        }
+    }
+
+    /**
+     * Recursive function to build up path from the $node and its children.
+     * Gathers all 'name' attributes and appends them to $path. Adds final file
+     * paths to $_files.
+     *
+     * @throws PackageXmlException
+     * @param SimpleXMLElement $node Node to process
+     * @param string           $path Current path
+     * @return void
+     */
+    protected function _getFiles(SimpleXMLElement $node, $path = '')
+    {
+        foreach ($node->children() as $type => $childNode) {
+            /* @var $childNode SimpleXMLElement */
+            $attr = $childNode->attributes();
+
+            if (('dir' == $type  ||  'file' == $type) && !isset($attr['name'])) {
+                throw new PackageXmlException("No 'name' attribute in '{$type}' element\n");
+            }
+
+            switch ($type) {
+                case 'dir':
+                    $this->_getFiles($childNode, $path.$attr['name'].'/');
+                    break;
+
+                case 'file':
+                    if (!isset($attr['role'])) {
+                        throw new PackageXmlException("No 'role' attribute in 'file' node\n");
+                    }
+
+                    $target = (string)$attr['role'];
+
+                    if (!isset($this->_targets[$target])) {
+                        throw new PackageXmlException("Unknown target: {$attr['role']}");
+                    }
+
+                    $partialPath = $path.$attr['name'];
+                    $fullPath = $this->_magentoPath.$this->_targets[$target].$partialPath;
+                    $this->_files[$partialPath] = $fullPath;
+                    break;
+
+                default:
+                    throw new PackageXmlException("Unknown node name: {$type}");
+            }
+        }
+    }
+
+    /**
+     * Returns files paths containing in package.xml
+     * Result: array of [$partialPath => $fullPath]
+     * $partialPath is a path relative to the target.
+     * e.g. Namespace/Module/Block/Someblock.php for
+     * magelocal/magecommunity/magecore targets
+     *
+     * @throws PackageXmlException
+     * @return array
+     */
+    public function getFiles()
+    {
+        $nodes = $this->_xml->xpath("//_:dir[@name='/']");
+
+        if (empty($nodes)) {
+            throw new PackageXmlException('No elements to process');
+        }
+
+        foreach ($nodes as $node) {
+            $this->_getFiles($node);
+        }
+
+        return $this->_files;
+    }
+
+    /**
+     * Returns node or attribute value by doing XPath. Basically, $nodeName is
+     * part of XPath query and attached to /package/. The function will return
+     * string if find only one element and if it contains simple string.
+     * SimpleXMLElement is returned in case the node has children. Array of
+     * SimpleXMLElement if there's several nodes matching query. false if
+     * nothing was found.
+     *
+     * Example:
+     *  To get license you'll need to specify 'license' as $nodeName in this
+     *  case the resulting query will look like /_:package/_:license
+     *  If you need to get license URI you need to pass 'license' as $nodeName
+     *  and 'uri' as $attributeName. In this case the function will return value
+     *  of 'uri' attribute of the above query.
+     *
+     * @param string $nodeName      Part of XPath query
+     * @param string $attributeName Name of the attribute
+     * @return false|string|array|SimpleXMLElement
+     */
+    public function getInfo($nodeName, $attributeName = '')
+    {
+        $xpath = '/_:package/_:'.str_replace('/', '/_:', $nodeName);
+        $nodes = $this->_xml->xpath($xpath);
+        $result = $nodes;
+
+        if ($attributeName) {
+            $attributes = array();
+
+            foreach ($nodes as $node) {
+                $nodeAttributes = $node->attributes();
+                if (isset($nodeAttributes[$attributeName])) {
+                    $attributes[] = $nodeAttributes[$attributeName];
+                }
+            }
+
+            $result = $attributes;
+        }
+
+        $return = false;
+
+        if (count($result) > 1) {
+            $return = $result;
+
+        } elseif (count($result) == 1) {
+            if (count($result[0]) > 1) {
+                $return = $result[0]; // SimpleXMLElement
+
+            } else {
+                $return = (string)$result[0];
+            }
+        }
+
+        return $return;
+    }
+
+    /**
+     * Returns code pool ('local', 'community' or 'core')
+     *
+     * @throws PackageXmlException
+     * @return string
+     */
+    public function getCodePool()
+    {
+        $channel = $this->getInfo('channel');
+
+        if (!$channel) {
+            throw new PackageXmlException('Can not find <channel> node');
+        }
+
+        if(!preg_match('~.+/(.+)~', $channel, $matches)) {
+            throw new PackageXmlException('<channel> node has incorrect format');
+        }
+
+        return $matches[1];
+    }
+
+    /**
+     * Returns module name, e.g. Namespace_Modulename
+     *
+     * @throws PackageXmlException
+     * @return string
+     */
+    public function getModuleName()
+    {
+        $xml = $this->_xml->xpath("//_:dir[@name='/']");
+        $namespace = false;
+
+        foreach ($xml[0]->children() as $name => $node) {
+            /* @var $node SimpleXMLElement */
+            $dirName = (string)$node->attributes()->name;
+
+            if (preg_match('/^[A-Z0-9]/', $dirName)) {
+                // Usually all system folders have only small letters,
+                // so in most cases the folder which name begins with an upper
+                // case letter will indicate namespace.
+                // I don't think this is a reliable solution, but at the
+                // moment I have no idea how do I fetch the namespace from
+                // the package.xml
+
+                $namespace = $dirName;
+                break;
+            }
+        }
+
+        $name =  $this->getInfo('name');
+
+        if (!$name) {
+            throw new PackageXmlException('Unable to find <name> node');
+        }
+
+        if (!$namespace) {
+            throw new PackageXmlException(
+                'Unable to determine module name. Try to supply --module option.');
+        }
+
+        return $namespace.'_'.$name;
+    }
+}
+
+/**
+ * Holds all the config-related actions (retrieving, saving, checking options)
+ *
+ * @throws ConfigException
+ */
+class Config
+{
+    const MAGE_PATH = 'magento';
+    const ACTION = 'action';
+    const PACKAGE_FILE_PATH = 'package-file-path';
+    const PACKAGE_FILE = 'package-file'; // synthetic
+    const MODULE = 'module';
+    const CODE_POOL = 'code-pool';
+    const FORCE = 'force';
+
+    protected $_defaultOptions = array(self::MAGE_PATH => './');
+    protected $_options = array();
+
+    /**
+     * Saves option in the registry
+     *
+     * @throws ConfigException
+     * @param string      $name  Name of an option
+     * @param string|bool $value Value of an option
+     * @return void
+     */
+    public function setOption($name, $value)
+    {
+        switch ($name) {
+            case self::MAGE_PATH:
+                if (!$value = realpath($value)) {
+                    throw new ConfigException('Can not resolve path to Magento');
+                }
+
+                $value = self::AddSlash($value);
+                break;
+
+            case self::PACKAGE_FILE_PATH:
+            case self::ACTION:
+            case self::MODULE:
+            case self::CODE_POOL:
+                // Options which require values
+                if (empty($value) || $value === true) {
+                    throw new ConfigException("Invalid value for '{$name}'");
+                }
+
+                break;
+
+            case self::FORCE:
+                // Flags (options those do not require value)
+                break;
+
+            default:
+                throw new ConfigException("Invalid option: {$name}");
+        }
+
+        $this->_options[$name] = $value;
+    }
+
+    /**
+     * Returns either supplied or default (if wasn't specified explicitly) value
+     * of an option
+     *
+     * @param string $name Name of the option
+     * @return bool|string
+     */
+    public function getOption($name)
+    {
+        switch ($name) {
+            case self::PACKAGE_FILE:
+                return basename($this->_options[self::PACKAGE_FILE_PATH]);
+
+            default:
+                if (isset($this->_options[$name])) {
+                    return  $this->_options[$name];
+
+                } elseif (isset($this->_defaultOptions[$name])) {
+                    return $this->_defaultOptions[$name];
+
+                } else {
+                    return false;
+                }
+        }
+
+    }
+
+    /**
+     * @return array
+     */
+    public function getOptions()
+    {
+        return $this->_options;
+    }
+
+    /**
+     * Add slash to the end of a directory path if necessary
+     *
+     * @static
+     * @param $dir Path to directory
+     * @return string
+     */
+    public static function AddSlash($dir)
+    {
+        if (strlen($dir) > 0  &&  $dir[strlen($dir) - 1] != '/') {
+            $dir .= '/';
+        }
+
+        return $dir;
+    }
+
+    /**
+     * Checks whether supplied options allowed by $validOptions
+     *
+     * @throws ConfigException
+     * @param array $validOptions Array of acceptable options
+     * @return void
+     */
+    public function checkOptions(array $validOptions)
+    {
+        foreach ($this->_options as $option => $value) {
+            if ('action' != $option  &&  !in_array($option, $validOptions)) {
+                throw new ConfigException("'{$option}' is not suitable for specified action");
+            }
+        }
+    }
+}
+
+/**
+ * Parses command line parameters
+ *
+ * @throws ParamsException
+ */
+class CliParams
+{
+    protected $_params = array();
+    protected $_config = null;
+
+    public function __construct(array $params)
+    {
+        $this->_params = $params;
+        $this->_config = new Config();
+    }
+
+    /**
+     * Parses command line parameters into instance of Config
+     *
+     * @throws ParamsException
+     * @return Config
+     */
+    public function getConfig()
+    {
+        for ($i = 1; $i < count($this->_params); $i++) {
+            $this->_parseParams($i);
+        }
+
+        return $this->_config;
+    }
+
+    /**
+     * Parses a command line parameter and puts it into _config
+     *
+     * @throws ParamsException
+     * @param $index Parameter index
+     * @return void
+     */
+    protected function _parseParams($index)
+    {
+        $param = $this->_params[$index];
+
+        if (1 == $index) {
+            $this->_config->setOption(Config::ACTION, $param);
+            
+        } elseif (strlen($param) > 2  &&  substr($param, 0, 2) == '--') {
+            $param = substr($param, 2);
+            $arr = explode('=', $param);
+            $name = $arr[0];
+            $value = isset($arr[1]) ? $arr[1] : true;
+            $this->_config->setOption($name, $value);
+
+        } elseif ($packageFile = $this->_config->getOption(Config::PACKAGE_FILE_PATH)) {
+            throw new ParamsException("Package file already specified as {$packageFile}");
+
+        } else {
+            $this->_config->setOption(Config::PACKAGE_FILE_PATH, $param);
+        }
+    }
+
+
+}
+
+/**
+ * Performs necessary action, e.g. 'install', 'enable', 'info'...
+ *
+ * @throws ActionException
+ */
+class Action
+{
+    const INSTALL = 'install';
+    const ENABLE = 'enable';
+    const DISABLE = 'disable';
+    const REMOVE = 'remove';
+    const INFO = 'info';
+
+    protected $_config = null;
+    protected $_magePath = '';
+    protected $_force = false;
+
+    protected $_allowedOptions = array(
+        self::ENABLE => array(
+            Config::CODE_POOL,
+            Config::MAGE_PATH,
+            Config::MODULE,
+            Config::PACKAGE_FILE_PATH,
+        ),
+
+        self::DISABLE => array(
+            Config::MAGE_PATH,
+            Config::MODULE,
+        ),
+
+        self::INSTALL => array(
+            Config::MAGE_PATH,
+            Config::PACKAGE_FILE_PATH,
+        ),
+
+        self::REMOVE => array(
+            Config::MAGE_PATH,
+            Config::PACKAGE_FILE_PATH,
+            Config::MODULE,
+        ),
+
+        self::INFO => array(
+            Config::PACKAGE_FILE_PATH,
+        ),
+    );
+
+    public function __construct(Config $config)
+    {
+        $this->_config = $config;
+        $this->_magePath = $this->_config->getOption(Config::MAGE_PATH);
+        $this->_force = $this->_config->getOption(Config::FORCE);
+    }
+
+    /**
+     * Runs an action. Basically, what it does is passes the control to
+     * $this->'_'.$action() method.
+     *
+     * @throws ActionException
+     * @param bool $action see constants
+     * @return void
+     */
+    public function run($action = false)
+    {
+        if (!$action && !$action = $this->_config->getOption(Config::ACTION)) {
+            throw new ActionException('Action was not specified');
+        }
+
+        $method = '_'.$action;
+
+        if (method_exists($this, $method)) {
+            $this->_config->checkOptions($this->_allowedOptions[$action]);
+            $this->$method();
+
+        } else {
+            throw new ConfigException("Unknown action: {$action}");
+        }
+    }
+    
+    /**
+     * Checks whether Magento path is valid. This does not need for every action
+     * ('info' does not require it), so we calling it on demand only.
+     *
+     * @throws ActionException
+     * @return void
+     */
+    protected function _checkMagePath()
+    {
+        if (!file_exists($this->_magePath.'app') || !is_dir($this->_magePath.'app')) {
+            throw new ActionException("'{$this->_magePath}' does not look like Magento installation directory\n");
+        }
+    }
+
+    /**
+     * Unpacks package archive to a temporary directory. Returns path of unpacking.
+     *
+     * @throws ActionException
+     * @return string
+     */
+    protected function _unpack()
+    {
+        $packageFilePath = $this->_config->getOption(Config::PACKAGE_FILE_PATH);
+
+        if (!$packageFilePath) {
+            throw new ActionException('Path to package (.tgz) file required');
+        }
+
+        if (!file_exists($packageFilePath)) {
+            throw new ActionException("The file '{$packageFilePath}' does not exist");
+        }
+
+        $packageFile = $this->_config->getOption(Config::PACKAGE_FILE);
+        $tmpDir = sys_get_temp_dir().'/'.$packageFile.'/';
+
+        @mkdir($tmpDir);
+        system("tar xzf {$packageFilePath} -C {$tmpDir}", $exitCode);
+
+        if ($exitCode !== 0) {
+            throw new ActionException("Error unpacking {$packageFilePath} to {$tmpDir}\n");
+        }
+
+        return $tmpDir;
+    }
+    
+    /**
+     * Installs the package. The action does not make it active in Mage_All.xml, though.
+     *
+     * @throws ActionException
+     * @return void
+     */
+    protected function _install()
+    {
+        $this->_checkMagePath();
+        $tmpDir = $this->_unpack();
+        $packageFile = $this->_config->getOption(Config::PACKAGE_FILE);
+        // /tmp/MyPackage-0.1.0.tgz/package.xml
+        $packageXmlFile = "{$tmpDir}package.xml";
+        $packageXml = new PackageXml($this->_config);
+        // MyPackage-0.1.0
+        $dirWithFiles = pathinfo($packageFile, PATHINFO_FILENAME).'/';
+
+        $packageXml->loadFile($packageXmlFile);
+
+        foreach ($packageXml->getFiles() as $partialPath => $fullPath) {
+            echo $partialPath.'... ';
+            $destDir = dirname($fullPath);
+
+            if (!is_dir($destDir) && !mkdir($destDir, 0777 ^ umask(), true)) {
+                throw new ActionException("Unable to create directory tree {$destDir}\n");
+            }
+
+            if (!is_writable($destDir)) {
+                throw new ActionException("{$destDir} is unwritable\n");
+            }
+
+            // /tmp/MyPackage-0.1.0.tgz/MyPackage-0.1.0/NameSpace/Module/Block/File.php
+            $from = $tmpDir.$dirWithFiles.$partialPath;
+
+            if (!copy($from, $fullPath)) {
+                throw new ActionException("Error copying {$from} to {$fullPath}\n");
+            }
+
+            echo "OK\n";
+        }
+
+        echo "Done\n";
+    }
+
+    /**
+     * Enables or disables module in Mage_All.xml. May change codePool, as well.
+     *
+     * @throws ActionException
+     * @param string $action ENABLE or DISABLE constant
+     * @return void
+     */
+    protected function _changeModuleOptions($action)
+    {
+        assert(in_array($action, array(self::ENABLE, self::DISABLE)));
+        $isMakeActive = (self::ENABLE == $action);
+        $this->_checkMagePath();
+        $mageAllPath = $this->_magePath.'app/etc/modules/Mage_All.xml';
+
+        if (!file_exists($mageAllPath)) {
+            throw new ActionException("Can not locate {$mageAllPath}");
+        }
+
+        $module = $this->_config->getOption(Config::MODULE);
+        $packageFile = $this->_config->getOption(Config::PACKAGE_FILE_PATH);
+
+        if ($module && $packageFile) {
+            throw new ActionException('Please specify either module name or path to package file, not both');
+        }
+
+        if (!$module && !$packageFile) {
+            throw new ActionException('Please specify either module name or path to package file');
+        }
+
+        $packageXml = null;
+
+        if ($packageFile) {
+            $tmpDir = $this->_unpack();
+            $packageXml = new PackageXml($this->_config);
+            $packageXml->loadFile("{$tmpDir}package.xml");
+            $module = $packageXml->getModuleName();
+        }
+
+        if (!preg_match('/.+?_[^_]+/', $module)) {
+            throw new ActionException('Invalid module name. Should look like Namespace_Modulename');
+        }
+
+        $moduleDir = str_replace('_', '/', $module);
+        $pathsToModule = array();
+        $codePool = '';
+        $destCodePool = $this->_config->getOption(Config::CODE_POOL);
+
+        if ($isMakeActive && !$destCodePool) {
+            try {
+                $destCodePool = $packageXml->getCodePool();
+
+            } catch (PackageXmlException $e) {
+                throw new ActionException('Can not fetch code pool from package file. Please specify it manually using --code-pool');
+            }
+        }
+
+        foreach (array('community', 'local', 'core') as $_codePool) {
+            $path = "{$this->_magePath}app/code/{$_codePool}/{$moduleDir}";
+
+            if (is_dir($path)) {
+                $codePool = $_codePool;
+                $pathsToModule[$_codePool] = $path;
+            }
+        }
+
+        if (empty($pathsToModule)) {
+            throw new ActionException("Module {$module} not found");
+        }
+
+        if ($isMakeActive) {
+            if (!$destCodePool && count($pathsToModule) > 1) {
+                throw new ActionException(
+                    "Module {$module} found in several code pools. Please specify "
+                    .'code pool explicitly using --code-pool');
+            }
+
+            if ($destCodePool && !isset($pathsToModule[$destCodePool])) {
+                throw new ActionException("{$module} not found in specified code pool");
+            }
+
+            $codePool = $destCodePool ? $destCodePool : $codePool;
+        }
+
+        $xml = simplexml_load_file($mageAllPath);
+
+        if (!isset($xml->modules->$module)) {
+            if ($isMakeActive) {
+                $xml->modules->addChild($module);
+                $xml->modules->$module->addChild('active');
+                $xml->modules->$module->addChild('codePool');
+
+            } else {
+                echo "No record about {$module} - nothing to do\n";
+            }
+        }
+
+        if ($isMakeActive || isset($xml->modules->$module)) {
+            $xml->modules->$module->active = $isMakeActive ? 'true' : 'false';
+            $isMakeActive && ($xml->modules->$module->codePool = $codePool);
+
+            if ($xml->asXML($mageAllPath)) {
+                echo "{$module} {$action}d in '{$codePool}' code pool\n";
+
+            } else {
+                throw new ActionException("Can not save changes to {$mageAllPath}");
+            }
+        }
+    }
+
+    /**
+     * Enables package in Mage_All.xml
+     *
+     * @return void
+     */
+    protected function _enable()
+    {
+        $this->_changeModuleOptions(self::ENABLE);
+    }
+
+    /**
+     * Disables package in Mage_All.xml
+     *
+     * @return void
+     */
+    protected function _disable()
+    {
+        $this->_changeModuleOptions(self::DISABLE);
+    }
+
+    /**
+     * Displays information about the package
+     *
+     * @return void
+     */
+    protected function _info()
+    {
+        $tmpDir = $this->_unpack();
+        $packageXml = new PackageXml($this->_config);
+        $packageXml->loadFile("{$tmpDir}package.xml");
+        $authors = array();
+        $authorNodes = $packageXml->getInfo('lead');
+        // Make array if we got only one author
+        $authorNodes = is_array($authorNodes) ? $authorNodes : array($authorNodes);
+
+        foreach ($authorNodes as $authorNode) {
+            $author  = $authorNode->name;
+            $author .= ' ('.$authorNode->user.') ';
+            $author .= $authorNode->email;
+            $authors[] = $author;
+        }
+
+        $license  = $packageXml->getInfo('license');
+        $license .= ' ('.$packageXml->getInfo('license', 'uri').')';
+
+        $required['php']  = $packageXml->getInfo('dependencies/required/php/min');
+        $required['php'] .= '-'.$packageXml->getInfo('dependencies/required/php/max');
+
+        if ($requiredPackageNodes = $packageXml->getInfo('dependencies/required/package')) {
+            if (!is_array($requiredPackageNodes)) {
+                $requiredPackageNodes = array($requiredPackageNodes);
+            }
+
+            foreach ($requiredPackageNodes as $node) {
+                $requiredPackage  = $node->name;
+                $requiredPackage .= " ({$node->min}-{$node->max})";
+                $required['packages'][] = $requiredPackage;
+            }            
+        }
+
+        if ($requiredExtensionNodes = $packageXml->getInfo('dependencies/required/extension')) {
+            if (!is_array($requiredExtensionNodes)) {
+                $requiredExtensionNodes = array($requiredExtensionNodes);
+            }
+
+            foreach ($requiredExtensionNodes as $node) {
+                $requiredExtension  = $node->name;
+                $requiredExtension .= " ({$node->min}-{$node->max})";
+                $required['extensions'][] = $requiredExtension;
+            }            
+        }
+        
+        $info = array(
+            'Module' => $packageXml->getModuleName(),
+            'Version' => $packageXml->getInfo('version/release'),
+            'Stability' => $packageXml->getInfo('stability/release'),
+            'Code pool' => $packageXml->getCodePool(),
+            'Authors' => count($authors) > 1 ? $authors : $authors[0],
+            'License' => $license,
+            'Packaged' => $packageXml->getInfo('date').' '.$packageXml->getInfo('time'),
+            'Summary' => $packageXml->getInfo('summary'),
+            'Required PHP version' => $required['php'],
+        );
+        
+        if (isset($required['packages'])) {
+            $requiredPackages = $required['packages'];
+            
+            if (count($required['packages']) == 1) {
+                $requiredPackages = $required['packages'][0];
+            }
+            
+            $info['Required packages'] = $requiredPackages; 
+        }
+        
+        if (isset($required['extensions'])) {
+            $requiredExtensions = $required['extensions'];
+            
+            if (count($required['extensions']) == 1) {
+                $requiredExtensions = $required['extensions'][0];
+            }
+            
+            $info['Required extensions'] = $requiredExtensions; 
+        }
+
+        $info += array (
+            'Description' => $packageXml->getInfo('description'),
+            'Release notes' => $packageXml->getInfo('notes'),
+            'Files' => array_keys($packageXml->getFiles()),
+        );
+
+        // Output
+        foreach ($info as $label => $data) {
+            echo $label.': ';
+
+            if (is_string($data)) {
+                if (strlen($data) < (80 - (strlen($label) + 2))) {
+                    echo $data;
+
+                } else {
+                    echo "\n";
+                    $line = 0;
+
+                    while ($echo = substr($data, $line * 72, 72)) {
+                        echo "\t".str_replace(array(chr(13), chr(10)), '', $echo)."\n";
+                        $line++;
+                    }
+                }
+
+            } elseif (is_array($data)) {
+                echo "\n";
+
+                foreach ($data as $element) {
+                    echo "\t".$element."\n";
+                }
+            }
+
+            echo "\n";
+        }
+    }
+
+    /**
+     * Removes all package-related files and record from Mage_All.xml
+     *
+     * @throws ActionException
+     * @return void
+     */
+    protected function _remove()
+    {
+        $this->_checkMagePath();
+        $tmpDir = $this->_unpack();
+        $packageXml = new PackageXml($this->_config);
+        $packageXml->loadFile("{$tmpDir}package.xml");
+
+        if (!$moduleName = $this->_config->getOption(Config::MODULE)) {
+            $moduleName = $packageXml->getModuleName();
+        }
+
+        $files = $packageXml->getFiles();
+        $configXmlPath = false;
+
+        foreach ($files as $path) {
+            if (basename($path) == 'config.xml') {
+                $configXmlPath = $path;
+            }
+        }
+
+        $configVersion = false;
+
+        if (
+            $configXmlPath
+            && file_exists($configXmlPath)
+            && is_readable($configXmlPath))
+        {
+            $configXml = simplexml_load_file($configXmlPath);
+            $configVersion = (string)$configXml->modules[0]->$moduleName->version;
+        }
+
+        $version = $packageXml->getInfo('version/release');
+
+        if ($configVersion && ($configVersion != $version) && !$this->_force) {
+            throw new ActionException(
+                'Package and installed module version mismatch. Use --force if '
+                .'you know what you are doing.');
+        }
+
+        echo "Removing {$moduleName} v{$version}\n";
+        $mageAllXmlPath = $this->_magePath.'app/etc/modules/Mage_All.xml';
+
+        if (!is_file($mageAllXmlPath) || !is_readable($mageAllXmlPath)) {
+            throw new ActionException("Unable to read {$mageAllXmlPath}");
+        }
+
+        $mageAllXml = simplexml_load_file($mageAllXmlPath);
+        $isNodeRemoved = false;
+
+        if (isset($mageAllXml->modules->$moduleName)) {
+            unset($mageAllXml->modules->$moduleName);
+            $isNodeRemoved = true;
+        }
+
+        if (!$mageAllXml->asXML($mageAllXmlPath)) {
+            throw new ActionException("Can not write to {$mageAllXmlPath}");
+
+        } elseif ($isNodeRemoved) {
+            echo "Module node removed from Mage_All.xml\n";
+        }
+
+        foreach ($files as $path) {
+            if (file_exists($path)) {
+                if (unlink($path)) {
+                    echo $path." - removed\n";
+
+                } else {
+                    echo "WARNING: can not remove {$path}\n";
+                }
+            }
+
+            // --- remove empty directories --
+
+            $dirArr = explode('/', dirname($path));
+            $i = count($dirArr);
+            $ok = true;
+
+            while ($ok) {
+                // We can't use realpath($dirArr.'/..') because it will
+                // return false for not existing path
+                $dirPath = implode('/', array_slice($dirArr, 0, $i));
+                $i--;
+                $ok = $i > 0;
+                // Don't check anything on the same level or below Magento
+                // installation folder
+                $ok = $ok && (Config::AddSlash($dirPath) != $this->_magePath);
+
+                // Skip non-existing dir. Probably we'll get something on the
+                // level below
+                if (!is_dir($dirPath)) {
+                    continue;
+                }
+
+                if ($ok = $ok && $this->_isDirEmpty($dirPath)) {
+                    if (rmdir($dirPath)) {
+                        echo "{$dirPath}/ - removed\n";
+
+                    } else {
+                        echo "WARNING: unable to remove {$path}\n";
+                    }
+                }
+            }
+        }
+
+        echo "Done\n";
+    }
+
+    /**
+     * Determines whether directory is empty
+     *
+     * @param $dirPath Path to directory
+     * @return bool
+     */
+    protected function _isDirEmpty($dirPath)
+    {
+        $files = scandir($dirPath);
+
+        if (empty($files)) {
+            return true;
+        }
+
+        if (count($files) > 2) {
+            return false;
+        }
+
+        foreach ($files as $file) {
+            if ($file != '.' && $file != '..') {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+class NoConnectionException extends Exception {}
+class PackageXmlException   extends NoConnectionException {}
+class ParamsException       extends NoConnectionException {}
+class ActionException       extends NoConnectionException {}
+class ConfigException       extends NoConnectionException {}
+
+function printUsage()
+{
+    echo "Usage: noconnection ACTION [OPTION...] [PACKAGE-FILE]\n";
+    echo "noconnection installs Magento packages from command line\n";
+    echo "\n";
+    echo "Examples:\n";
+    echo "\tnoconnection install --magento=/home/user/magento MyPackage-0.1.0.tgz\n";
+    echo "\tnoconnection enable --module=Namespace_Modulename --code-pool=community\n";
+    echo "\tnoconnection enable MyPackage-0.1.0.tgz\n";
+    echo "\tnoconnection remove MyPackage-0.1.0.tgz\n";
+    echo "\n";
+    echo "Actions:\n";
+    echo "\tinstall\t\tInstall a package\n";
+    echo "\tenable\t\tEnable module in Mage_All.xml\n";
+    echo "\tdisable\t\tDisable module in Mage_All.xml\n";
+    echo "\tremove\t\tRemove all package related files from Magento installation\n";
+    echo "\t\t\tand record from Mage_All.xml\n";
+    echo "\tinfo\t\tDisplay information about the package\n";
+    echo "\n";
+    echo "Options:\n";
+    echo "\t--magento\tPath to Magento installation\n";
+    echo "\t\t\t(where 'app' folder is located, default is '.')\n";
+    echo "\t--module\tModule name (for enable/disable action)\n";
+    echo "\t--code-pool\tSpecify code pool in which to enable module (for enable action)\n";
+    echo "\t\t\tThis option has higher priority over fetching code pool from\n";
+    echo "\t\t\tpackage file (in case it was specified)\n";
+    echo "\t--force\t\tForce some potentially harmful operations\n";
+    echo "\n";
+}
+?>
